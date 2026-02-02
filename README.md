@@ -1,11 +1,21 @@
 # mcp-smoke
 
+![CI](https://github.com/Agent-Hellboy/mcp-smoke/actions/workflows/ci.yml/badge.svg)
+[![Go Reference](https://pkg.go.dev/badge/github.com/Agent-Hellboy/mcp-smoke.svg)](https://pkg.go.dev/github.com/Agent-Hellboy/mcp-smoke)
+[![Go Report Card](https://goreportcard.com/badge/github.com/Agent-Hellboy/mcp-smoke)](https://goreportcard.com/report/github.com/Agent-Hellboy/mcp-smoke)
+
 Simple MCP server smoke-test CLI for CI.
 
 ## Install
 
 ```bash
 go install github.com/Agent-Hellboy/mcp-smoke/cmd/mcp-smoke@latest
+```
+
+Install a tagged release:
+
+```bash
+go install github.com/Agent-Hellboy/mcp-smoke/cmd/mcp-smoke@v0.1.0
 ```
 
 ## Usage
