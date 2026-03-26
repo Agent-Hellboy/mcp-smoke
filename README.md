@@ -28,7 +28,10 @@ The new `mcp-agent` binary connects to an MCP server, lists its tools, and lets 
 OpenAI with a single server flag:
 
 ```bash
-export OPENAI_API_KEY=...
+cat > .env <<'EOF'
+OPENAI_API_KEY=your-key-here
+EOF
+
 go run ./cmd/mcp-agent --server "go run ./cmd/mcp-test-server"
 ```
 
@@ -68,7 +71,13 @@ By default the agent reads:
 - `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`
 - `OPENAI_MODEL` or `ANTHROPIC_MODEL`
 
+It will auto-load those values from `.env` in the current working directory. Real shell environment variables still take precedence, and you can point to a different file with `--env-file path/to/file.env`.
+
 Default models are `gpt-4.1-mini` for OpenAI and `claude-3-5-haiku-latest` for Anthropic. Override them with `--model` if needed.
+
+### GitHub E2E
+
+If you set the repo secret `OPENAI_API_KEY`, CI will run a live e2e check for `mcp-agent` against the bundled `mcp-test-server`. The workflow writes a temporary `.env`, runs the agent, and asserts both the MCP tool call and the final `42` response.
 
 ### Streamable HTTP
 

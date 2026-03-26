@@ -21,10 +21,12 @@ const (
 	defaultProtocol       = "2025-06-18"
 	defaultOpenAIModel    = "gpt-4.1-mini"
 	defaultAnthropicModel = "claude-3-5-haiku-latest"
+	defaultEnvFile        = ".env"
 )
 
 type config struct {
 	server    string
+	envFile   string
 	transport string
 	url       string
 	command   string
@@ -104,6 +106,7 @@ func main() {
 func parseConfig() config {
 	var cfg config
 	flag.StringVar(&cfg.server, "server", "", "server spec: http URL, stdio command string, or JSON array command")
+	flag.StringVar(&cfg.envFile, "env-file", defaultEnvFile, "dotenv file to read for API keys and model names; empty disables")
 	flag.StringVar(&cfg.transport, "transport", "", "transport: stdio or http")
 	flag.StringVar(&cfg.url, "url", "", "streamable HTTP endpoint url")
 	flag.StringVar(&cfg.command, "command", "", "stdio command to run")
@@ -124,21 +127,26 @@ func parseConfig() config {
 		fail(err.Error())
 	}
 
-	provider, err := resolveProvider(cfg.provider)
+	fileEnv, err := readEnvFile(cfg.envFile)
+	if err != nil {
+		fail(err.Error())
+	}
+
+	provider, err := resolveProvider(cfg.provider, fileEnv)
 	if err != nil {
 		fail(err.Error())
 	}
 	cfg.provider = provider
 
 	if cfg.apiKey == "" {
-		cfg.apiKey = providerAPIKey(cfg.provider)
+		cfg.apiKey = providerAPIKey(cfg.provider, fileEnv)
 	}
 	if cfg.apiKey == "" {
-		fail("missing API key for provider %q", cfg.provider)
+		fail("missing API key for provider %q; set it in %s", cfg.provider, apiKeyLocationHint(cfg.envFile))
 	}
 
 	if cfg.model == "" {
-		cfg.model = providerModel(cfg.provider)
+		cfg.model = providerModel(cfg.provider, fileEnv)
 	}
 	if cfg.model == "" {
 		fail("missing model for provider %q", cfg.provider)
@@ -206,7 +214,7 @@ func parseServerSpec(spec string) (transport, url, command string, args []string
 	return "stdio", "", parts[0], parts[1:], nil
 }
 
-func resolveProvider(explicit string) (string, error) {
+func resolveProvider(explicit string, fileEnv map[string]string) (string, error) {
 	if explicit != "" {
 		switch explicit {
 		case "openai", "anthropic":
@@ -216,8 +224,8 @@ func resolveProvider(explicit string) (string, error) {
 		}
 	}
 
-	hasOpenAI := strings.TrimSpace(os.Getenv("OPENAI_API_KEY")) != ""
-	hasAnthropic := strings.TrimSpace(os.Getenv("ANTHROPIC_API_KEY")) != ""
+	hasOpenAI := envValue("OPENAI_API_KEY", fileEnv) != ""
+	hasAnthropic := envValue("ANTHROPIC_API_KEY", fileEnv) != ""
 
 	switch {
 	case hasOpenAI && !hasAnthropic:
@@ -231,32 +239,112 @@ func resolveProvider(explicit string) (string, error) {
 	}
 }
 
-func providerAPIKey(provider string) string {
+func providerAPIKey(provider string, fileEnv map[string]string) string {
 	switch provider {
 	case "openai":
-		return strings.TrimSpace(os.Getenv("OPENAI_API_KEY"))
+		return envValue("OPENAI_API_KEY", fileEnv)
 	case "anthropic":
-		return strings.TrimSpace(os.Getenv("ANTHROPIC_API_KEY"))
+		return envValue("ANTHROPIC_API_KEY", fileEnv)
 	default:
 		return ""
 	}
 }
 
-func providerModel(provider string) string {
+func providerModel(provider string, fileEnv map[string]string) string {
 	switch provider {
 	case "openai":
-		if model := strings.TrimSpace(os.Getenv("OPENAI_MODEL")); model != "" {
+		if model := envValue("OPENAI_MODEL", fileEnv); model != "" {
 			return model
 		}
 		return defaultOpenAIModel
 	case "anthropic":
-		if model := strings.TrimSpace(os.Getenv("ANTHROPIC_MODEL")); model != "" {
+		if model := envValue("ANTHROPIC_MODEL", fileEnv); model != "" {
 			return model
 		}
 		return defaultAnthropicModel
 	default:
 		return ""
 	}
+}
+
+func readEnvFile(path string) (map[string]string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return map[string]string{}, nil
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) && path == defaultEnvFile {
+			return map[string]string{}, nil
+		}
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+	defer f.Close()
+
+	values, err := parseDotEnv(f)
+	if err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	return values, nil
+}
+
+func parseDotEnv(r io.Reader) (map[string]string, error) {
+	values := make(map[string]string)
+	scanner := bufio.NewScanner(r)
+
+	for lineNo := 1; scanner.Scan(); lineNo++ {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		if strings.HasPrefix(line, "export ") {
+			line = strings.TrimSpace(strings.TrimPrefix(line, "export "))
+		}
+
+		key, rawValue, ok := strings.Cut(line, "=")
+		if !ok {
+			return nil, fmt.Errorf("line %d: expected KEY=VALUE", lineNo)
+		}
+
+		key = strings.TrimSpace(key)
+		if key == "" {
+			return nil, fmt.Errorf("line %d: empty key", lineNo)
+		}
+
+		value := strings.TrimSpace(rawValue)
+		if len(value) >= 2 {
+			switch {
+			case value[0] == '"' && value[len(value)-1] == '"':
+				value = value[1 : len(value)-1]
+			case value[0] == '\'' && value[len(value)-1] == '\'':
+				value = value[1 : len(value)-1]
+			}
+		}
+
+		values[key] = value
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return values, nil
+}
+
+func envValue(key string, fileEnv map[string]string) string {
+	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+		return value
+	}
+	return strings.TrimSpace(fileEnv[key])
+}
+
+func apiKeyLocationHint(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "the shell environment or --api-key"
+	}
+	return fmt.Sprintf("%s, the shell environment, or --api-key", path)
 }
 
 func readPromptFromPipe(r *os.File) (bool, string) {

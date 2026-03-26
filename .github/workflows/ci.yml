@@ -25,3 +25,25 @@ jobs:
         run: |
           docker build -t mcp-smoke .
           docker run --rm mcp-smoke
+
+  agent-e2e:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Run live agent e2e
+        if: ${{ secrets.OPENAI_API_KEY != '' }}
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: ./scripts/agent-e2e.sh
+
+      - name: Skip live agent e2e when no secret is configured
+        if: ${{ secrets.OPENAI_API_KEY == '' }}
+        run: echo "Skipping agent e2e because OPENAI_API_KEY is not configured."
