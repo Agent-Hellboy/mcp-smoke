@@ -18,7 +18,7 @@ trap cleanup EXIT
 printf 'OPENAI_API_KEY=%s\n' "$KEY" > "$ENV_FILE"
 unset OPENAI_API_KEY
 
-go run ./cmd/mcp-agent \
+go run ./cmd/mcp-smoke-agent agent \
   --env-file "$ENV_FILE" \
   --server "go run ./cmd/mcp-test-server" \
   --prompt "add 41 and 1" \

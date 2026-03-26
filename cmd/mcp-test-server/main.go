@@ -53,6 +53,11 @@ type toolCallParams struct {
 	Arguments map[string]interface{} `json:"arguments"`
 }
 
+type promptGetParams struct {
+	Name      string                 `json:"name"`
+	Arguments map[string]interface{} `json:"arguments"`
+}
+
 func main() {
 	reader := bufio.NewReader(os.Stdin)
 	for {
@@ -112,14 +117,6 @@ func handle(req rpcRequest) rpcResponse {
 		resp.Result = map[string]interface{}{
 			"tools": []toolDef{
 				{
-					Name:        "ping",
-					Description: "Returns a simple pong response.",
-					InputSchema: map[string]interface{}{
-						"type":       "object",
-						"properties": map[string]interface{}{},
-					},
-				},
-				{
 					Name:        "echo",
 					Description: "Echoes back the provided text.",
 					InputSchema: map[string]interface{}{
@@ -151,6 +148,14 @@ func handle(req rpcRequest) rpcResponse {
 						"required": []string{"a", "b"},
 					},
 				},
+				{
+					Name:        "ping",
+					Description: "Returns a simple pong response.",
+					InputSchema: map[string]interface{}{
+						"type":       "object",
+						"properties": map[string]interface{}{},
+					},
+				},
 			},
 		}
 	case "tools/call":
@@ -159,6 +164,17 @@ func handle(req rpcRequest) rpcResponse {
 		resp.Result = map[string]interface{}{
 			"prompts": []promptDef{
 				{
+					Name:        "hello-name",
+					Description: "Returns a greeting for the provided name.",
+					Arguments: []map[string]interface{}{
+						{
+							"name":        "name",
+							"description": "Name to greet.",
+							"required":    true,
+						},
+					},
+				},
+				{
 					Name:        "hello",
 					Description: "Returns a simple greeting.",
 					Arguments:   []map[string]interface{}{},
@@ -166,17 +182,7 @@ func handle(req rpcRequest) rpcResponse {
 			},
 		}
 	case "prompts/get":
-		resp.Result = map[string]interface{}{
-			"messages": []map[string]interface{}{
-				{
-					"role": "user",
-					"content": map[string]interface{}{
-						"type": "text",
-						"text": "Hello from prompt",
-					},
-				},
-			},
-		}
+		resp.Result, resp.Error = handlePromptGet(req.Params)
 	case "resources/list":
 		resp.Result = map[string]interface{}{
 			"resources": []resourceDef{
@@ -236,6 +242,42 @@ func handleToolCall(raw json.RawMessage) (interface{}, *rpcError) {
 	default:
 		return nil, &rpcError{Code: -32601, Message: fmt.Sprintf("tool not found: %s", params.Name)}
 	}
+}
+
+func handlePromptGet(raw json.RawMessage) (interface{}, *rpcError) {
+	var params promptGetParams
+	if err := json.Unmarshal(raw, &params); err != nil {
+		return nil, &rpcError{Code: -32602, Message: "invalid prompts/get params"}
+	}
+	if params.Arguments == nil {
+		params.Arguments = map[string]interface{}{}
+	}
+
+	var text string
+	switch params.Name {
+	case "hello":
+		text = "Hello from prompt"
+	case "hello-name":
+		name, _ := params.Arguments["name"].(string)
+		if strings.TrimSpace(name) == "" {
+			return nil, &rpcError{Code: -32602, Message: "hello-name.name is required"}
+		}
+		text = "Hello, " + name
+	default:
+		return nil, &rpcError{Code: -32601, Message: fmt.Sprintf("prompt not found: %s", params.Name)}
+	}
+
+	return map[string]interface{}{
+		"messages": []map[string]interface{}{
+			{
+				"role": "user",
+				"content": map[string]interface{}{
+					"type": "text",
+					"text": text,
+				},
+			},
+		},
+	}, nil
 }
 
 func textToolResult(text string) map[string]interface{} {

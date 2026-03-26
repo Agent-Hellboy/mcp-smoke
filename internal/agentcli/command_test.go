@@ -1,4 +1,4 @@
-package main
+package agentcli
 
 import (
 	"strings"
@@ -8,9 +8,9 @@ import (
 func TestParseServerSpecHTTP(t *testing.T) {
 	t.Parallel()
 
-	transport, url, command, args, err := parseServerSpec("https://example.com/mcp")
+	transport, url, command, args, err := ParseServerSpec("https://example.com/mcp")
 	if err != nil {
-		t.Fatalf("parseServerSpec returned error: %v", err)
+		t.Fatalf("ParseServerSpec returned error: %v", err)
 	}
 	if transport != "http" {
 		t.Fatalf("expected http transport, got %q", transport)
@@ -29,9 +29,9 @@ func TestParseServerSpecHTTP(t *testing.T) {
 func TestParseServerSpecCommandString(t *testing.T) {
 	t.Parallel()
 
-	transport, url, command, args, err := parseServerSpec("go run ./cmd/mcp-test-server")
+	transport, url, command, args, err := ParseServerSpec("go run ./cmd/mcp-test-server")
 	if err != nil {
-		t.Fatalf("parseServerSpec returned error: %v", err)
+		t.Fatalf("ParseServerSpec returned error: %v", err)
 	}
 	if transport != "stdio" {
 		t.Fatalf("expected stdio transport, got %q", transport)
@@ -50,9 +50,9 @@ func TestParseServerSpecCommandString(t *testing.T) {
 func TestParseServerSpecJSONArray(t *testing.T) {
 	t.Parallel()
 
-	transport, url, command, args, err := parseServerSpec(`["go","run","./cmd/mcp-test-server"]`)
+	transport, url, command, args, err := ParseServerSpec(`["go","run","./cmd/mcp-test-server"]`)
 	if err != nil {
-		t.Fatalf("parseServerSpec returned error: %v", err)
+		t.Fatalf("ParseServerSpec returned error: %v", err)
 	}
 	if transport != "stdio" {
 		t.Fatalf("expected stdio transport, got %q", transport)
@@ -71,14 +71,14 @@ func TestParseServerSpecJSONArray(t *testing.T) {
 func TestParseDotEnv(t *testing.T) {
 	t.Parallel()
 
-	values, err := parseDotEnv(strings.NewReader(`
+	values, err := ParseDotEnv(strings.NewReader(`
 # comment
 OPENAI_API_KEY=sk-test
 OPENAI_MODEL="gpt-4.1-mini"
 export ANTHROPIC_MODEL='claude-3-5-haiku-latest'
 `))
 	if err != nil {
-		t.Fatalf("parseDotEnv returned error: %v", err)
+		t.Fatalf("ParseDotEnv returned error: %v", err)
 	}
 
 	if got := values["OPENAI_API_KEY"]; got != "sk-test" {

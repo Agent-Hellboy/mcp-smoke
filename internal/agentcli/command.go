@@ -1,4 +1,4 @@
-package main
+package agentcli
 
 import (
 	"bufio"
@@ -18,10 +18,11 @@ import (
 )
 
 const (
-	defaultProtocol       = "2025-06-18"
-	defaultOpenAIModel    = "gpt-4.1-mini"
-	defaultAnthropicModel = "claude-3-5-haiku-latest"
-	defaultEnvFile        = ".env"
+	DefaultProtocol       = "2025-06-18"
+	DefaultOpenAIModel    = "gpt-4.1-mini"
+	DefaultAnthropicModel = "claude-3-5-haiku-latest"
+	DefaultEnvFile        = ".env"
+	ClientVersion         = "0.3.0"
 )
 
 type config struct {
@@ -40,31 +41,42 @@ type config struct {
 	args      []string
 }
 
-func main() {
-	cfg := parseConfig()
+func Run(args []string, stdout, stderr io.Writer) int {
+	cfg, err := parseConfig(args, stderr)
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		failf(stderr, err.Error())
+		return 2
+	}
 
 	client, err := mcp.NewClient(cfg.transport, cfg.url, cfg.command, cfg.args, cfg.timeout)
 	if err != nil {
-		fail(err.Error())
+		failf(stderr, err.Error())
+		return 1
 	}
 	defer client.Close()
 
 	startupCtx, cancel := context.WithTimeout(context.Background(), cfg.timeout)
 	defer cancel()
 
-	initResult, err := mcp.Initialize(startupCtx, client, cfg.protocol, "mcp-agent", "0.1.0")
+	initResult, err := mcp.Initialize(startupCtx, client, cfg.protocol, "mcp-smoke-agent", ClientVersion)
 	if err != nil {
-		fail("initialize failed: %v", err)
+		failf(stderr, "initialize failed: %v", err)
+		return 1
 	}
 	_ = mcp.NotifyInitialized(startupCtx, client)
 
 	if !mcp.HasCapability(initResult.Capabilities, "tools") {
-		fail("server does not advertise tools capability")
+		failf(stderr, "server does not advertise tools capability")
+		return 1
 	}
 
 	tools, err := loadTools(startupCtx, client)
 	if err != nil {
-		fail(err.Error())
+		failf(stderr, err.Error())
+		return 1
 	}
 
 	runner, err := agent.New(agent.Config{
@@ -72,69 +84,80 @@ func main() {
 		Model:    cfg.model,
 		APIKey:   cfg.apiKey,
 		MaxSteps: cfg.maxSteps,
-		Log:      os.Stderr,
+		Log:      stderr,
 	})
 	if err != nil {
-		fail(err.Error())
+		failf(stderr, err.Error())
+		return 1
 	}
 
 	if prompt := strings.TrimSpace(cfg.prompt); prompt != "" {
 		answer, err := runPrompt(cfg.timeout, runner, client, prompt)
 		if err != nil {
-			fail(err.Error())
+			failf(stderr, err.Error())
+			return 1
 		}
-		fmt.Println(answer)
-		return
+		fmt.Fprintln(stdout, answer)
+		return 0
 	}
 
 	if piped, prompt := readPromptFromPipe(os.Stdin); piped {
 		if prompt == "" {
-			fail("stdin was piped but no prompt was provided")
+			failf(stderr, "stdin was piped but no prompt was provided")
+			return 1
 		}
 		answer, err := runPrompt(cfg.timeout, runner, client, prompt)
 		if err != nil {
-			fail(err.Error())
+			failf(stderr, err.Error())
+			return 1
 		}
-		fmt.Println(answer)
-		return
+		fmt.Fprintln(stdout, answer)
+		return 0
 	}
 
-	printBanner(cfg, initResult, tools)
-	runREPL(cfg.timeout, runner, client)
+	printBanner(stderr, cfg, initResult, tools)
+	runREPL(stdout, stderr, cfg.timeout, runner, client)
+	return 0
 }
 
-func parseConfig() config {
+func parseConfig(args []string, stderr io.Writer) (config, error) {
 	var cfg config
-	flag.StringVar(&cfg.server, "server", "", "server spec: http URL, stdio command string, or JSON array command")
-	flag.StringVar(&cfg.envFile, "env-file", defaultEnvFile, "dotenv file to read for API keys and model names; empty disables")
-	flag.StringVar(&cfg.transport, "transport", "", "transport: stdio or http")
-	flag.StringVar(&cfg.url, "url", "", "streamable HTTP endpoint url")
-	flag.StringVar(&cfg.command, "command", "", "stdio command to run")
-	flag.StringVar(&cfg.protocol, "protocol", defaultProtocol, "client protocol version")
-	flag.StringVar(&cfg.provider, "provider", "", "llm provider: openai or anthropic")
-	flag.StringVar(&cfg.model, "model", "", "llm model name")
-	flag.StringVar(&cfg.apiKey, "api-key", "", "provider API key")
-	flag.StringVar(&cfg.prompt, "prompt", "", "single prompt to run; omit for interactive mode")
-	flag.DurationVar(&cfg.timeout, "timeout", 60*time.Second, "timeout per prompt")
-	flag.IntVar(&cfg.maxSteps, "max-steps", 8, "maximum model/tool turns per prompt")
-	flag.Parse()
 
-	cfg.args = flag.Args()
+	fs := flag.NewFlagSet("agent", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	fs.StringVar(&cfg.server, "server", "", "server spec: http URL, stdio command string, or JSON array command")
+	fs.StringVar(&cfg.envFile, "env-file", DefaultEnvFile, "dotenv file to read for API keys and model names; empty disables")
+	fs.StringVar(&cfg.transport, "transport", "", "transport: stdio or http")
+	fs.StringVar(&cfg.url, "url", "", "streamable HTTP endpoint url")
+	fs.StringVar(&cfg.command, "command", "", "stdio command to run")
+	fs.StringVar(&cfg.protocol, "protocol", DefaultProtocol, "client protocol version")
+	fs.StringVar(&cfg.provider, "provider", "", "llm provider: openai or anthropic")
+	fs.StringVar(&cfg.model, "model", "", "llm model name")
+	fs.StringVar(&cfg.apiKey, "api-key", "", "provider API key")
+	fs.StringVar(&cfg.prompt, "prompt", "", "single prompt to run; omit for interactive mode")
+	fs.DurationVar(&cfg.timeout, "timeout", 60*time.Second, "timeout per prompt")
+	fs.IntVar(&cfg.maxSteps, "max-steps", 8, "maximum model/tool turns per prompt")
+
+	if err := fs.Parse(args); err != nil {
+		return cfg, err
+	}
+
+	cfg.args = fs.Args()
 	if cfg.protocol == "" {
-		cfg.protocol = defaultProtocol
+		cfg.protocol = DefaultProtocol
 	}
 	if err := applyServerSpec(&cfg); err != nil {
-		fail(err.Error())
+		return cfg, err
 	}
 
 	fileEnv, err := readEnvFile(cfg.envFile)
 	if err != nil {
-		fail(err.Error())
+		return cfg, err
 	}
 
 	provider, err := resolveProvider(cfg.provider, fileEnv)
 	if err != nil {
-		fail(err.Error())
+		return cfg, err
 	}
 	cfg.provider = provider
 
@@ -142,17 +165,17 @@ func parseConfig() config {
 		cfg.apiKey = providerAPIKey(cfg.provider, fileEnv)
 	}
 	if cfg.apiKey == "" {
-		fail("missing API key for provider %q; set it in %s", cfg.provider, apiKeyLocationHint(cfg.envFile))
+		return cfg, fmt.Errorf("missing API key for provider %q; set it in %s", cfg.provider, apiKeyLocationHint(cfg.envFile))
 	}
 
 	if cfg.model == "" {
 		cfg.model = providerModel(cfg.provider, fileEnv)
 	}
 	if cfg.model == "" {
-		fail("missing model for provider %q", cfg.provider)
+		return cfg, fmt.Errorf("missing model for provider %q", cfg.provider)
 	}
 
-	return cfg
+	return cfg, nil
 }
 
 func applyServerSpec(cfg *config) error {
@@ -165,7 +188,7 @@ func applyServerSpec(cfg *config) error {
 		return errors.New("--server cannot be combined with --transport, --url, --command, or trailing stdio args")
 	}
 
-	transport, url, command, args, err := parseServerSpec(spec)
+	transport, url, command, args, err := ParseServerSpec(spec)
 	if err != nil {
 		return err
 	}
@@ -177,7 +200,7 @@ func applyServerSpec(cfg *config) error {
 	return nil
 }
 
-func parseServerSpec(spec string) (transport, url, command string, args []string, err error) {
+func ParseServerSpec(spec string) (transport, url, command string, args []string, err error) {
 	spec = strings.TrimSpace(spec)
 	if spec == "" {
 		return "", "", "", nil, errors.New("empty --server value")
@@ -256,12 +279,12 @@ func providerModel(provider string, fileEnv map[string]string) string {
 		if model := envValue("OPENAI_MODEL", fileEnv); model != "" {
 			return model
 		}
-		return defaultOpenAIModel
+		return DefaultOpenAIModel
 	case "anthropic":
 		if model := envValue("ANTHROPIC_MODEL", fileEnv); model != "" {
 			return model
 		}
-		return defaultAnthropicModel
+		return DefaultAnthropicModel
 	default:
 		return ""
 	}
@@ -275,21 +298,21 @@ func readEnvFile(path string) (map[string]string, error) {
 
 	f, err := os.Open(path)
 	if err != nil {
-		if os.IsNotExist(err) && path == defaultEnvFile {
+		if os.IsNotExist(err) && path == DefaultEnvFile {
 			return map[string]string{}, nil
 		}
 		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
 	defer f.Close()
 
-	values, err := parseDotEnv(f)
+	values, err := ParseDotEnv(f)
 	if err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 	return values, nil
 }
 
-func parseDotEnv(r io.Reader) (map[string]string, error) {
+func ParseDotEnv(r io.Reader) (map[string]string, error) {
 	values := make(map[string]string)
 	scanner := bufio.NewScanner(r)
 
@@ -363,24 +386,24 @@ func readPromptFromPipe(r *os.File) (bool, string) {
 	return true, strings.TrimSpace(string(body))
 }
 
-func printBanner(cfg config, initResult mcp.InitializeResult, tools []mcp.Tool) {
+func printBanner(stderr io.Writer, cfg config, initResult mcp.InitializeResult, tools []mcp.Tool) {
 	serverName := "mcp-server"
 	if name, ok := initResult.ServerInfo["name"].(string); ok && name != "" {
 		serverName = name
 	}
 
-	fmt.Fprintf(os.Stderr, "connected to %s via %s using %s/%s\n", serverName, transportLabel(cfg), cfg.provider, cfg.model)
-	fmt.Fprintln(os.Stderr, "type plain English, `tools` to inspect the MCP tools, or `quit` to exit")
-	fmt.Fprintln(os.Stderr, "available tools:")
-	printTools(os.Stderr, tools)
+	fmt.Fprintf(stderr, "connected to %s via %s using %s/%s\n", serverName, transportLabel(cfg), cfg.provider, cfg.model)
+	fmt.Fprintln(stderr, "type plain English, `tools` to inspect the MCP tools, or `quit` to exit")
+	fmt.Fprintln(stderr, "available tools:")
+	printTools(stderr, tools)
 }
 
-func runREPL(timeout time.Duration, runner *agent.Runner, client mcp.Client) {
+func runREPL(stdout, stderr io.Writer, timeout time.Duration, runner *agent.Runner, client mcp.Client) {
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
 	for {
-		fmt.Fprint(os.Stderr, "> ")
+		fmt.Fprint(stderr, "> ")
 		if !scanner.Scan() {
 			break
 		}
@@ -396,19 +419,19 @@ func runREPL(timeout time.Duration, runner *agent.Runner, client mcp.Client) {
 		case "tools", "help":
 			tools, err := loadToolsWithTimeout(timeout, client)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "error: %v\n", err)
+				fmt.Fprintf(stderr, "error: %v\n", err)
 				continue
 			}
-			printTools(os.Stderr, tools)
+			printTools(stderr, tools)
 			continue
 		}
 
 		answer, err := runPrompt(timeout, runner, client, line)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			fmt.Fprintf(stderr, "error: %v\n", err)
 			continue
 		}
-		fmt.Println(answer)
+		fmt.Fprintln(stdout, answer)
 	}
 }
 
@@ -480,7 +503,6 @@ func prettyJSON(raw json.RawMessage) string {
 	return strings.TrimSpace(string(raw))
 }
 
-func fail(format string, args ...interface{}) {
-	fmt.Fprintf(os.Stderr, format+"\n", args...)
-	os.Exit(1)
+func failf(w io.Writer, format string, args ...interface{}) {
+	fmt.Fprintf(w, format+"\n", args...)
 }
