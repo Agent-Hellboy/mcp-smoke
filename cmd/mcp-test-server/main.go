@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -46,24 +48,43 @@ type resourceDef struct {
 	MimeType    string `json:"mimeType"`
 }
 
-func main() {
-	scanner := bufio.NewScanner(os.Stdin)
-	enc := json.NewEncoder(os.Stdout)
+type toolCallParams struct {
+	Name      string                 `json:"name"`
+	Arguments map[string]interface{} `json:"arguments"`
+}
 
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
+func main() {
+	reader := bufio.NewReader(os.Stdin)
+	for {
+		payload, err := readRPCMessage(reader)
+		if err != nil {
+			if err == io.EOF {
+				return
+			}
+			fmt.Fprintf(os.Stderr, "read error: %v\n", err)
+			return
+		}
+		if len(payload) == 0 {
 			continue
 		}
+
 		var req rpcRequest
-		if err := json.Unmarshal([]byte(line), &req); err != nil {
+		if err := json.Unmarshal(payload, &req); err != nil {
 			continue
 		}
 		if req.ID == nil {
 			continue
 		}
+
 		resp := handle(req)
-		_ = enc.Encode(resp)
+		body, err := json.Marshal(resp)
+		if err != nil {
+			continue
+		}
+		if err := writeRPCMessage(os.Stdout, body); err != nil {
+			fmt.Fprintf(os.Stderr, "write error: %v\n", err)
+			return
+		}
 	}
 }
 
@@ -98,17 +119,42 @@ func handle(req rpcRequest) rpcResponse {
 						"properties": map[string]interface{}{},
 					},
 				},
-			},
-		}
-	case "tools/call":
-		resp.Result = map[string]interface{}{
-			"content": []map[string]interface{}{
 				{
-					"type": "text",
-					"text": "pong",
+					Name:        "echo",
+					Description: "Echoes back the provided text.",
+					InputSchema: map[string]interface{}{
+						"type": "object",
+						"properties": map[string]interface{}{
+							"text": map[string]interface{}{
+								"type":        "string",
+								"description": "Text to echo back.",
+							},
+						},
+						"required": []string{"text"},
+					},
+				},
+				{
+					Name:        "add",
+					Description: "Adds two numbers together.",
+					InputSchema: map[string]interface{}{
+						"type": "object",
+						"properties": map[string]interface{}{
+							"a": map[string]interface{}{
+								"type":        "number",
+								"description": "First number.",
+							},
+							"b": map[string]interface{}{
+								"type":        "number",
+								"description": "Second number.",
+							},
+						},
+						"required": []string{"a", "b"},
+					},
 				},
 			},
 		}
+	case "tools/call":
+		resp.Result, resp.Error = handleToolCall(req.Params)
 	case "prompts/list":
 		resp.Result = map[string]interface{}{
 			"prompts": []promptDef{
@@ -158,5 +204,132 @@ func handle(req rpcRequest) rpcResponse {
 			Message: fmt.Sprintf("method not found: %s", req.Method),
 		}
 	}
+
 	return resp
+}
+
+func handleToolCall(raw json.RawMessage) (interface{}, *rpcError) {
+	var params toolCallParams
+	if err := json.Unmarshal(raw, &params); err != nil {
+		return nil, &rpcError{Code: -32602, Message: "invalid tools/call params"}
+	}
+	if params.Arguments == nil {
+		params.Arguments = map[string]interface{}{}
+	}
+
+	switch params.Name {
+	case "ping":
+		return textToolResult("pong"), nil
+	case "echo":
+		text, _ := params.Arguments["text"].(string)
+		if strings.TrimSpace(text) == "" {
+			return nil, &rpcError{Code: -32602, Message: "echo.text is required"}
+		}
+		return textToolResult(text), nil
+	case "add":
+		a, okA := asFloat(params.Arguments["a"])
+		b, okB := asFloat(params.Arguments["b"])
+		if !okA || !okB {
+			return nil, &rpcError{Code: -32602, Message: "add.a and add.b must be numbers"}
+		}
+		return textToolResult(formatNumber(a + b)), nil
+	default:
+		return nil, &rpcError{Code: -32601, Message: fmt.Sprintf("tool not found: %s", params.Name)}
+	}
+}
+
+func textToolResult(text string) map[string]interface{} {
+	return map[string]interface{}{
+		"content": []map[string]interface{}{
+			{
+				"type": "text",
+				"text": text,
+			},
+		},
+	}
+}
+
+func asFloat(value interface{}) (float64, bool) {
+	switch n := value.(type) {
+	case float64:
+		return n, true
+	case float32:
+		return float64(n), true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case json.Number:
+		v, err := n.Float64()
+		return v, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func formatNumber(value float64) string {
+	return strconv.FormatFloat(value, 'f', -1, 64)
+}
+
+func readRPCMessage(reader *bufio.Reader) ([]byte, error) {
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF && len(strings.TrimSpace(line)) > 0 {
+				return []byte(strings.TrimSpace(line)), nil
+			}
+			return nil, err
+		}
+
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+
+		if strings.HasPrefix(strings.ToLower(trimmed), "content-length:") {
+			length, err := parseContentLength(trimmed)
+			if err != nil {
+				return nil, err
+			}
+			for {
+				header, err := reader.ReadString('\n')
+				if err != nil {
+					return nil, err
+				}
+				if strings.TrimSpace(header) == "" {
+					break
+				}
+			}
+
+			payload := make([]byte, length)
+			if _, err := io.ReadFull(reader, payload); err != nil {
+				return nil, err
+			}
+			return payload, nil
+		}
+
+		if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
+			return []byte(trimmed), nil
+		}
+	}
+}
+
+func parseContentLength(line string) (int, error) {
+	parts := strings.SplitN(line, ":", 2)
+	if len(parts) != 2 {
+		return 0, fmt.Errorf("invalid content-length header: %s", line)
+	}
+	length, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err != nil || length < 0 {
+		return 0, fmt.Errorf("invalid content-length header: %s", line)
+	}
+	return length, nil
+}
+
+func writeRPCMessage(w io.Writer, payload []byte) error {
+	if _, err := fmt.Fprintf(w, "Content-Length: %d\r\n\r\n", len(payload)); err != nil {
+		return err
+	}
+	_, err := w.Write(payload)
+	return err
 }

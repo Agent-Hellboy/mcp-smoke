@@ -1,42 +1,15 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
-	"os/exec"
-	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
+
+	"github.com/Agent-Hellboy/mcp-smoke/internal/mcp"
 )
-
-type rpcRequest struct {
-	JSONRPC string      `json:"jsonrpc"`
-	ID      int64       `json:"id,omitempty"`
-	Method  string      `json:"method"`
-	Params  interface{} `json:"params,omitempty"`
-}
-
-type rpcResponse struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      int64           `json:"id,omitempty"`
-	Result  json.RawMessage `json:"result,omitempty"`
-	Error   *rpcError       `json:"error,omitempty"`
-}
-
-type rpcError struct {
-	Code    int         `json:"code"`
-	Message string      `json:"message"`
-	Data    interface{} `json:"data,omitempty"`
-}
 
 type stepResult struct {
 	Name       string          `json:"name"`
@@ -59,268 +32,6 @@ type output struct {
 	StartedAt    string                 `json:"started_at"`
 	FinishedAt   string                 `json:"finished_at"`
 	DurationMs   int64                  `json:"duration_ms"`
-}
-
-type client interface {
-	Request(ctx context.Context, method string, params interface{}) (rpcResponse, error)
-	Notify(ctx context.Context, method string, params interface{}) error
-	Close() error
-}
-
-type stdioClient struct {
-	cmd      *exec.Cmd
-	stdin    io.WriteCloser
-	stdout   io.ReadCloser
-	stderr   *bytes.Buffer
-	reqID    int64
-	respMu   sync.Mutex
-	waiters  map[int64]chan rpcResponse
-	readDone chan error
-}
-
-func newStdioClient(command string, args []string) (*stdioClient, error) {
-	if command == "" {
-		return nil, errors.New("missing command for stdio transport")
-	}
-	cmd := exec.Command(command, args...)
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return nil, err
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, err
-	}
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Start(); err != nil {
-		return nil, err
-	}
-	c := &stdioClient{
-		cmd:      cmd,
-		stdin:    stdin,
-		stdout:   stdout,
-		stderr:   &stderr,
-		waiters:  make(map[int64]chan rpcResponse),
-		readDone: make(chan error, 1),
-	}
-	go c.readLoop()
-	return c, nil
-}
-
-func (c *stdioClient) nextID() int64 {
-	return atomic.AddInt64(&c.reqID, 1)
-}
-
-func (c *stdioClient) readLoop() {
-	scanner := bufio.NewScanner(c.stdout)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		var resp rpcResponse
-		if err := json.Unmarshal([]byte(line), &resp); err != nil {
-			continue
-		}
-		if resp.ID == 0 {
-			continue
-		}
-		c.respMu.Lock()
-		ch := c.waiters[resp.ID]
-		if ch != nil {
-			delete(c.waiters, resp.ID)
-		}
-		c.respMu.Unlock()
-		if ch != nil {
-			ch <- resp
-		}
-	}
-	c.readDone <- scanner.Err()
-}
-
-func (c *stdioClient) Request(ctx context.Context, method string, params interface{}) (rpcResponse, error) {
-	id := c.nextID()
-	req := rpcRequest{
-		JSONRPC: "2.0",
-		ID:      id,
-		Method:  method,
-		Params:  params,
-	}
-	msg, err := json.Marshal(req)
-	if err != nil {
-		return rpcResponse{}, err
-	}
-	ch := make(chan rpcResponse, 1)
-	c.respMu.Lock()
-	c.waiters[id] = ch
-	c.respMu.Unlock()
-	if _, err := c.stdin.Write(append(msg, '\n')); err != nil {
-		return rpcResponse{}, err
-	}
-	select {
-	case <-ctx.Done():
-		return rpcResponse{}, ctx.Err()
-	case resp := <-ch:
-		return resp, nil
-	}
-}
-
-func (c *stdioClient) Notify(ctx context.Context, method string, params interface{}) error {
-	req := rpcRequest{
-		JSONRPC: "2.0",
-		Method:  method,
-		Params:  params,
-	}
-	msg, err := json.Marshal(req)
-	if err != nil {
-		return err
-	}
-	_, err = c.stdin.Write(append(msg, '\n'))
-	return err
-}
-
-func (c *stdioClient) Close() error {
-	_ = c.stdin.Close()
-	err := c.cmd.Process.Kill()
-	_ = c.cmd.Wait()
-	return err
-}
-
-type httpClient struct {
-	baseURL   string
-	client    *http.Client
-	reqID     int64
-	sessionID string
-}
-
-func newHTTPClient(url string, timeout time.Duration) (*httpClient, error) {
-	if url == "" {
-		return nil, errors.New("missing url for http transport")
-	}
-	return &httpClient{
-		baseURL: strings.TrimRight(url, "/"),
-		client: &http.Client{
-			Timeout: timeout,
-		},
-	}, nil
-}
-
-func (c *httpClient) nextID() int64 {
-	return atomic.AddInt64(&c.reqID, 1)
-}
-
-func (c *httpClient) Request(ctx context.Context, method string, params interface{}) (rpcResponse, error) {
-	id := c.nextID()
-	req := rpcRequest{
-		JSONRPC: "2.0",
-		ID:      id,
-		Method:  method,
-		Params:  params,
-	}
-	body, err := json.Marshal(req)
-	if err != nil {
-		return rpcResponse{}, err
-	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL, bytes.NewReader(body))
-	if err != nil {
-		return rpcResponse{}, err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept", "application/json, text/event-stream")
-	if c.sessionID != "" {
-		httpReq.Header.Set("Mcp-Session-Id", c.sessionID)
-	}
-	resp, err := c.client.Do(httpReq)
-	if err != nil {
-		return rpcResponse{}, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return rpcResponse{}, fmt.Errorf("http status %d: %s", resp.StatusCode, strings.TrimSpace(string(bodyBytes)))
-	}
-	if session := resp.Header.Get("Mcp-Session-Id"); session != "" {
-		c.sessionID = session
-	}
-	ct := resp.Header.Get("Content-Type")
-	if strings.HasPrefix(ct, "text/event-stream") {
-		return readSSEForID(resp.Body, id)
-	}
-	var rpcResp rpcResponse
-	dec := json.NewDecoder(resp.Body)
-	if err := dec.Decode(&rpcResp); err != nil {
-		return rpcResponse{}, err
-	}
-	return rpcResp, nil
-}
-
-func (c *httpClient) Notify(ctx context.Context, method string, params interface{}) error {
-	req := rpcRequest{
-		JSONRPC: "2.0",
-		Method:  method,
-		Params:  params,
-	}
-	body, err := json.Marshal(req)
-	if err != nil {
-		return err
-	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept", "application/json, text/event-stream")
-	if c.sessionID != "" {
-		httpReq.Header.Set("Mcp-Session-Id", c.sessionID)
-	}
-	resp, err := c.client.Do(httpReq)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if session := resp.Header.Get("Mcp-Session-Id"); session != "" {
-		c.sessionID = session
-	}
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("http status %d: %s", resp.StatusCode, strings.TrimSpace(string(bodyBytes)))
-	}
-	return nil
-}
-
-func (c *httpClient) Close() error {
-	return nil
-}
-
-func readSSEForID(r io.Reader, id int64) (rpcResponse, error) {
-	scanner := bufio.NewScanner(r)
-	var dataBuf []string
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
-			if len(dataBuf) == 0 {
-				continue
-			}
-			payload := strings.Join(dataBuf, "\n")
-			dataBuf = dataBuf[:0]
-			var resp rpcResponse
-			if err := json.Unmarshal([]byte(payload), &resp); err != nil {
-				continue
-			}
-			if resp.ID == id {
-				return resp, nil
-			}
-			continue
-		}
-		if strings.HasPrefix(line, "data:") {
-			dataBuf = append(dataBuf, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		return rpcResponse{}, err
-	}
-	return rpcResponse{}, errors.New("no response received for request id")
 }
 
 func main() {
@@ -346,18 +57,7 @@ func main() {
 		Args:      flag.Args(),
 	}
 
-	var c client
-	var err error
-	switch {
-	case *transport == "http" || (*transport == "" && *url != ""):
-		out.Transport = "http"
-		c, err = newHTTPClient(*url, *timeout)
-	case *transport == "stdio" || (*transport == "" && *command != ""):
-		out.Transport = "stdio"
-		c, err = newStdioClient(*command, flag.Args())
-	default:
-		err = errors.New("specify --transport=http with --url or --transport=stdio with --command")
-	}
+	c, err := mcp.NewClient(*transport, *url, *command, flag.Args(), *timeout)
 	if err != nil {
 		failAndPrint(out, err)
 		return
@@ -373,7 +73,7 @@ func main() {
 	if protocolVer != "" {
 		out.Protocol = protocolVer
 	}
-	_ = c.Notify(ctx, "notifications/initialized", map[string]interface{}{})
+	_ = mcp.NotifyInitialized(ctx, c)
 
 	steps := make([]stepResult, 0, 6)
 	steps = append(steps, listTools(ctx, c, caps))
@@ -391,9 +91,10 @@ func main() {
 			steps = append(steps, s)
 		}
 	}
-	out.Steps = append(out.Steps, steps...)
 
+	out.Steps = append(out.Steps, steps...)
 	out.OK = allStepsOK(out.Steps)
+
 	finished := time.Now().UTC()
 	out.FinishedAt = finished.Format(time.RFC3339)
 	out.DurationMs = finished.Sub(started).Milliseconds()
@@ -427,277 +128,174 @@ func allStepsOK(steps []stepResult) bool {
 	return true
 }
 
-func doInitialize(ctx context.Context, c client, protocol string) (stepResult, map[string]interface{}, string) {
+func doInitialize(ctx context.Context, c mcp.Client, protocol string) (stepResult, map[string]interface{}, string) {
 	start := time.Now()
-	params := map[string]interface{}{
-		"protocolVersion": protocol,
-		"clientInfo": map[string]interface{}{
-			"name":    "mcp-smoke",
-			"version": "0.1.0",
-		},
-		"capabilities": map[string]interface{}{},
-	}
-	resp, err := c.Request(ctx, "initialize", params)
+	result, err := mcp.Initialize(ctx, c, protocol, "mcp-smoke", "0.1.0")
 	if err != nil {
 		return stepResult{Name: "initialize", OK: false, Error: err.Error(), DurationMs: time.Since(start).Milliseconds()}, nil, ""
 	}
-	if resp.Error != nil {
-		return stepResult{Name: "initialize", OK: false, Error: resp.Error.Message, DurationMs: time.Since(start).Milliseconds()}, nil, ""
-	}
-	var result map[string]interface{}
-	if err := json.Unmarshal(resp.Result, &result); err != nil {
-		return stepResult{Name: "initialize", OK: false, Error: err.Error(), DurationMs: time.Since(start).Milliseconds()}, nil, ""
-	}
-	caps, _ := result["capabilities"].(map[string]interface{})
-	protocolVer, _ := result["protocolVersion"].(string)
+
 	detail, _ := json.Marshal(result)
-	return stepResult{Name: "initialize", OK: true, Detail: detail, DurationMs: time.Since(start).Milliseconds()}, caps, protocolVer
+	return stepResult{
+		Name:       "initialize",
+		OK:         true,
+		Detail:     detail,
+		DurationMs: time.Since(start).Milliseconds(),
+	}, result.Capabilities, result.ProtocolVersion
 }
 
-func listTools(ctx context.Context, c client, caps map[string]interface{}) stepResult {
-	if caps == nil || caps["tools"] == nil {
+func listTools(ctx context.Context, c mcp.Client, caps map[string]interface{}) stepResult {
+	if !mcp.HasCapability(caps, "tools") {
 		return stepResult{Name: "tools/list", OK: true, Skipped: true}
 	}
+
 	start := time.Now()
-	all := make([]interface{}, 0)
-	var cursor interface{} = nil
-	for {
-		params := map[string]interface{}{}
-		if cursor != nil {
-			params["cursor"] = cursor
-		}
-		resp, err := c.Request(ctx, "tools/list", params)
-		if err != nil {
-			return stepResult{Name: "tools/list", OK: false, Error: err.Error(), DurationMs: time.Since(start).Milliseconds()}
-		}
-		if resp.Error != nil {
-			return stepResult{Name: "tools/list", OK: false, Error: resp.Error.Message, DurationMs: time.Since(start).Milliseconds()}
-		}
-		var result map[string]interface{}
-		if err := json.Unmarshal(resp.Result, &result); err != nil {
-			return stepResult{Name: "tools/list", OK: false, Error: err.Error(), DurationMs: time.Since(start).Milliseconds()}
-		}
-		if items, ok := result["tools"].([]interface{}); ok {
-			all = append(all, items...)
-		}
-		if next, ok := result["nextCursor"]; ok && next != nil && next != "" {
-			cursor = next
-			continue
-		}
-		break
+	tools, err := mcp.ListTools(ctx, c)
+	if err != nil {
+		return stepResult{Name: "tools/list", OK: false, Error: err.Error(), DurationMs: time.Since(start).Milliseconds()}
 	}
-	detail, _ := json.Marshal(map[string]interface{}{"count": len(all)})
+
+	detail, _ := json.Marshal(map[string]interface{}{"count": len(tools)})
 	return stepResult{Name: "tools/list", OK: true, Detail: detail, DurationMs: time.Since(start).Milliseconds()}
 }
 
-func listPrompts(ctx context.Context, c client, caps map[string]interface{}) stepResult {
-	if caps == nil || caps["prompts"] == nil {
+func listPrompts(ctx context.Context, c mcp.Client, caps map[string]interface{}) stepResult {
+	if !mcp.HasCapability(caps, "prompts") {
 		return stepResult{Name: "prompts/list", OK: true, Skipped: true}
 	}
+
 	start := time.Now()
-	all := make([]interface{}, 0)
-	var cursor interface{} = nil
-	for {
-		params := map[string]interface{}{}
-		if cursor != nil {
-			params["cursor"] = cursor
-		}
-		resp, err := c.Request(ctx, "prompts/list", params)
-		if err != nil {
-			return stepResult{Name: "prompts/list", OK: false, Error: err.Error(), DurationMs: time.Since(start).Milliseconds()}
-		}
-		if resp.Error != nil {
-			return stepResult{Name: "prompts/list", OK: false, Error: resp.Error.Message, DurationMs: time.Since(start).Milliseconds()}
-		}
-		var result map[string]interface{}
-		if err := json.Unmarshal(resp.Result, &result); err != nil {
-			return stepResult{Name: "prompts/list", OK: false, Error: err.Error(), DurationMs: time.Since(start).Milliseconds()}
-		}
-		if items, ok := result["prompts"].([]interface{}); ok {
-			all = append(all, items...)
-		}
-		if next, ok := result["nextCursor"]; ok && next != nil && next != "" {
-			cursor = next
-			continue
-		}
-		break
+	prompts, err := mcp.ListPrompts(ctx, c)
+	if err != nil {
+		return stepResult{Name: "prompts/list", OK: false, Error: err.Error(), DurationMs: time.Since(start).Milliseconds()}
 	}
-	detail, _ := json.Marshal(map[string]interface{}{"count": len(all)})
+
+	detail, _ := json.Marshal(map[string]interface{}{"count": len(prompts)})
 	return stepResult{Name: "prompts/list", OK: true, Detail: detail, DurationMs: time.Since(start).Milliseconds()}
 }
 
-func listResources(ctx context.Context, c client, caps map[string]interface{}) stepResult {
-	if caps == nil || caps["resources"] == nil {
+func listResources(ctx context.Context, c mcp.Client, caps map[string]interface{}) stepResult {
+	if !mcp.HasCapability(caps, "resources") {
 		return stepResult{Name: "resources/list", OK: true, Skipped: true}
 	}
+
 	start := time.Now()
-	all := make([]interface{}, 0)
-	var cursor interface{} = nil
-	for {
-		params := map[string]interface{}{}
-		if cursor != nil {
-			params["cursor"] = cursor
-		}
-		resp, err := c.Request(ctx, "resources/list", params)
-		if err != nil {
-			return stepResult{Name: "resources/list", OK: false, Error: err.Error(), DurationMs: time.Since(start).Milliseconds()}
-		}
-		if resp.Error != nil {
-			return stepResult{Name: "resources/list", OK: false, Error: resp.Error.Message, DurationMs: time.Since(start).Milliseconds()}
-		}
-		var result map[string]interface{}
-		if err := json.Unmarshal(resp.Result, &result); err != nil {
-			return stepResult{Name: "resources/list", OK: false, Error: err.Error(), DurationMs: time.Since(start).Milliseconds()}
-		}
-		if items, ok := result["resources"].([]interface{}); ok {
-			all = append(all, items...)
-		}
-		if next, ok := result["nextCursor"]; ok && next != nil && next != "" {
-			cursor = next
-			continue
-		}
-		break
+	resources, err := mcp.ListResources(ctx, c)
+	if err != nil {
+		return stepResult{Name: "resources/list", OK: false, Error: err.Error(), DurationMs: time.Since(start).Milliseconds()}
 	}
-	detail, _ := json.Marshal(map[string]interface{}{"count": len(all)})
+
+	detail, _ := json.Marshal(map[string]interface{}{"count": len(resources)})
 	return stepResult{Name: "resources/list", OK: true, Detail: detail, DurationMs: time.Since(start).Milliseconds()}
 }
 
-func callFirstTool(ctx context.Context, c client, caps map[string]interface{}, rawArgs string) stepResult {
-	if caps == nil || caps["tools"] == nil {
+func callFirstTool(ctx context.Context, c mcp.Client, caps map[string]interface{}, rawArgs string) stepResult {
+	if !mcp.HasCapability(caps, "tools") {
 		return stepResult{Name: "tools/call", OK: true, Skipped: true}
 	}
+
 	start := time.Now()
-	resp, err := c.Request(ctx, "tools/list", map[string]interface{}{})
+	tools, err := mcp.ListTools(ctx, c)
 	if err != nil {
 		return stepResult{Name: "tools/call", OK: false, Error: err.Error(), DurationMs: time.Since(start).Milliseconds()}
 	}
-	if resp.Error != nil {
-		return stepResult{Name: "tools/call", OK: false, Error: resp.Error.Message, DurationMs: time.Since(start).Milliseconds()}
-	}
-	var result map[string]interface{}
-	if err := json.Unmarshal(resp.Result, &result); err != nil {
-		return stepResult{Name: "tools/call", OK: false, Error: err.Error(), DurationMs: time.Since(start).Milliseconds()}
-	}
-	tools, _ := result["tools"].([]interface{})
 	if len(tools) == 0 {
 		return stepResult{Name: "tools/call", OK: true, Skipped: true, DurationMs: time.Since(start).Milliseconds()}
 	}
-	tool, _ := tools[0].(map[string]interface{})
-	name, _ := tool["name"].(string)
-	if name == "" {
-		return stepResult{Name: "tools/call", OK: false, Error: "tool name missing", DurationMs: time.Since(start).Milliseconds()}
+
+	tool := tools[0]
+	if hasRequiredFields(tool.InputSchema) {
+		return stepResult{Name: "tools/call", OK: true, Skipped: true, DurationMs: time.Since(start).Milliseconds()}
 	}
-	if schema, ok := tool["inputSchema"].(map[string]interface{}); ok {
-		if req, ok := schema["required"].([]interface{}); ok && len(req) > 0 {
-			return stepResult{Name: "tools/call", OK: true, Skipped: true, DurationMs: time.Since(start).Milliseconds()}
-		}
-	}
-	var args map[string]interface{}
-	if err := json.Unmarshal([]byte(rawArgs), &args); err != nil {
+
+	args, err := parseJSONArgs(rawArgs)
+	if err != nil {
 		return stepResult{Name: "tools/call", OK: false, Error: "invalid --tool-args json", DurationMs: time.Since(start).Milliseconds()}
 	}
-	callParams := map[string]interface{}{
-		"name":      name,
-		"arguments": args,
-	}
-	callResp, err := c.Request(ctx, "tools/call", callParams)
-	if err != nil {
+	if _, err := mcp.CallTool(ctx, c, tool.Name, args); err != nil {
 		return stepResult{Name: "tools/call", OK: false, Error: err.Error(), DurationMs: time.Since(start).Milliseconds()}
-	}
-	if callResp.Error != nil {
-		return stepResult{Name: "tools/call", OK: false, Error: callResp.Error.Message, DurationMs: time.Since(start).Milliseconds()}
 	}
 	return stepResult{Name: "tools/call", OK: true, DurationMs: time.Since(start).Milliseconds()}
 }
 
-func getFirstPrompt(ctx context.Context, c client, caps map[string]interface{}, rawArgs string) stepResult {
-	if caps == nil || caps["prompts"] == nil {
+func getFirstPrompt(ctx context.Context, c mcp.Client, caps map[string]interface{}, rawArgs string) stepResult {
+	if !mcp.HasCapability(caps, "prompts") {
 		return stepResult{Name: "prompts/get", OK: true, Skipped: true}
 	}
+
 	start := time.Now()
-	resp, err := c.Request(ctx, "prompts/list", map[string]interface{}{})
+	prompts, err := mcp.ListPrompts(ctx, c)
 	if err != nil {
 		return stepResult{Name: "prompts/get", OK: false, Error: err.Error(), DurationMs: time.Since(start).Milliseconds()}
 	}
-	if resp.Error != nil {
-		return stepResult{Name: "prompts/get", OK: false, Error: resp.Error.Message, DurationMs: time.Since(start).Milliseconds()}
-	}
-	var result map[string]interface{}
-	if err := json.Unmarshal(resp.Result, &result); err != nil {
-		return stepResult{Name: "prompts/get", OK: false, Error: err.Error(), DurationMs: time.Since(start).Milliseconds()}
-	}
-	prompts, _ := result["prompts"].([]interface{})
 	if len(prompts) == 0 {
 		return stepResult{Name: "prompts/get", OK: true, Skipped: true, DurationMs: time.Since(start).Milliseconds()}
 	}
-	prompt, _ := prompts[0].(map[string]interface{})
-	name, _ := prompt["name"].(string)
-	if name == "" {
-		return stepResult{Name: "prompts/get", OK: false, Error: "prompt name missing", DurationMs: time.Since(start).Milliseconds()}
-	}
-	if args, ok := prompt["arguments"].([]interface{}); ok {
-		for _, a := range args {
-			arg, _ := a.(map[string]interface{})
-			if required, ok := arg["required"].(bool); ok && required {
-				return stepResult{Name: "prompts/get", OK: true, Skipped: true, DurationMs: time.Since(start).Milliseconds()}
-			}
+
+	prompt := prompts[0]
+	for _, arg := range prompt.Arguments {
+		if arg.Required {
+			return stepResult{Name: "prompts/get", OK: true, Skipped: true, DurationMs: time.Since(start).Milliseconds()}
 		}
 	}
-	var args map[string]interface{}
-	if err := json.Unmarshal([]byte(rawArgs), &args); err != nil {
+
+	args, err := parseJSONArgs(rawArgs)
+	if err != nil {
 		return stepResult{Name: "prompts/get", OK: false, Error: "invalid --prompt-args json", DurationMs: time.Since(start).Milliseconds()}
 	}
-	callParams := map[string]interface{}{
-		"name":      name,
-		"arguments": args,
-	}
-	callResp, err := c.Request(ctx, "prompts/get", callParams)
-	if err != nil {
+	if _, err := mcp.GetPrompt(ctx, c, prompt.Name, args); err != nil {
 		return stepResult{Name: "prompts/get", OK: false, Error: err.Error(), DurationMs: time.Since(start).Milliseconds()}
-	}
-	if callResp.Error != nil {
-		return stepResult{Name: "prompts/get", OK: false, Error: callResp.Error.Message, DurationMs: time.Since(start).Milliseconds()}
 	}
 	return stepResult{Name: "prompts/get", OK: true, DurationMs: time.Since(start).Milliseconds()}
 }
 
-func readFirstResource(ctx context.Context, c client, caps map[string]interface{}, resourceURI string) stepResult {
-	if caps == nil || caps["resources"] == nil {
+func readFirstResource(ctx context.Context, c mcp.Client, caps map[string]interface{}, resourceURI string) stepResult {
+	if !mcp.HasCapability(caps, "resources") {
 		return stepResult{Name: "resources/read", OK: true, Skipped: true}
 	}
+
 	start := time.Now()
 	uri := resourceURI
 	if uri == "" {
-		resp, err := c.Request(ctx, "resources/list", map[string]interface{}{})
+		resources, err := mcp.ListResources(ctx, c)
 		if err != nil {
 			return stepResult{Name: "resources/read", OK: false, Error: err.Error(), DurationMs: time.Since(start).Milliseconds()}
 		}
-		if resp.Error != nil {
-			return stepResult{Name: "resources/read", OK: false, Error: resp.Error.Message, DurationMs: time.Since(start).Milliseconds()}
-		}
-		var result map[string]interface{}
-		if err := json.Unmarshal(resp.Result, &result); err != nil {
-			return stepResult{Name: "resources/read", OK: false, Error: err.Error(), DurationMs: time.Since(start).Milliseconds()}
-		}
-		resources, _ := result["resources"].([]interface{})
 		if len(resources) == 0 {
 			return stepResult{Name: "resources/read", OK: true, Skipped: true, DurationMs: time.Since(start).Milliseconds()}
 		}
-		res, _ := resources[0].(map[string]interface{})
-		uri, _ = res["uri"].(string)
+		uri = resources[0].URI
 	}
 	if uri == "" {
 		return stepResult{Name: "resources/read", OK: true, Skipped: true, DurationMs: time.Since(start).Milliseconds()}
 	}
-	callParams := map[string]interface{}{
-		"uri": uri,
-	}
-	callResp, err := c.Request(ctx, "resources/read", callParams)
-	if err != nil {
+
+	if _, err := mcp.ReadResource(ctx, c, uri); err != nil {
 		return stepResult{Name: "resources/read", OK: false, Error: err.Error(), DurationMs: time.Since(start).Milliseconds()}
 	}
-	if callResp.Error != nil {
-		return stepResult{Name: "resources/read", OK: false, Error: callResp.Error.Message, DurationMs: time.Since(start).Milliseconds()}
-	}
 	return stepResult{Name: "resources/read", OK: true, DurationMs: time.Since(start).Milliseconds()}
+}
+
+func hasRequiredFields(schema map[string]interface{}) bool {
+	if schema == nil {
+		return false
+	}
+	required, ok := schema["required"].([]interface{})
+	return ok && len(required) > 0
+}
+
+func parseJSONArgs(raw string) (map[string]interface{}, error) {
+	var args map[string]interface{}
+	if err := json.Unmarshal([]byte(raw), &args); err != nil {
+		return nil, err
+	}
+	if args == nil {
+		args = map[string]interface{}{}
+	}
+	return args, nil
+}
+
+func fail(format string, args ...interface{}) {
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
+	os.Exit(1)
 }
