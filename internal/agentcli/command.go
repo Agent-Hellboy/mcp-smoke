@@ -123,7 +123,7 @@ func Run(args []string, stdout, stderr io.Writer) int {
 func parseConfig(args []string, stderr io.Writer) (config, error) {
 	var cfg config
 
-	fs := flag.NewFlagSet("agent", flag.ContinueOnError)
+	fs := flag.NewFlagSet("mcp-smoke-agent", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.StringVar(&cfg.server, "server", "", "server spec: http URL, stdio command string, or JSON array command")
 	fs.StringVar(&cfg.envFile, "env-file", DefaultEnvFile, "dotenv file to read for API keys and model names; empty disables")
@@ -134,7 +134,7 @@ func parseConfig(args []string, stderr io.Writer) (config, error) {
 	fs.StringVar(&cfg.provider, "provider", "", "llm provider: openai or anthropic")
 	fs.StringVar(&cfg.model, "model", "", "llm model name")
 	fs.StringVar(&cfg.apiKey, "api-key", "", "provider API key")
-	fs.StringVar(&cfg.prompt, "prompt", "", "single prompt to run; omit for interactive mode")
+	fs.StringVar(&cfg.prompt, "prompt", "", "single prompt to run; omit for stdin or interactive mode")
 	fs.DurationVar(&cfg.timeout, "timeout", 60*time.Second, "timeout per prompt")
 	fs.IntVar(&cfg.maxSteps, "max-steps", 8, "maximum model/tool turns per prompt")
 
@@ -142,12 +142,20 @@ func parseConfig(args []string, stderr io.Writer) (config, error) {
 		return cfg, err
 	}
 
-	cfg.args = fs.Args()
+	rest := fs.Args()
+	if cfg.prompt == "" && len(rest) > 0 && canUsePositionalPrompt(cfg) {
+		cfg.prompt = strings.TrimSpace(strings.Join(rest, " "))
+	} else {
+		cfg.args = rest
+	}
 	if cfg.protocol == "" {
 		cfg.protocol = DefaultProtocol
 	}
 	if err := applyServerSpec(&cfg); err != nil {
 		return cfg, err
+	}
+	if cfg.url == "" && cfg.command == "" {
+		return cfg, errors.New("missing MCP server; pass --server or use --transport with --url/--command")
 	}
 
 	fileEnv, err := readEnvFile(cfg.envFile)
@@ -176,6 +184,16 @@ func parseConfig(args []string, stderr io.Writer) (config, error) {
 	}
 
 	return cfg, nil
+}
+
+func canUsePositionalPrompt(cfg config) bool {
+	if cfg.server != "" {
+		return true
+	}
+	if cfg.command != "" || cfg.transport == "stdio" {
+		return false
+	}
+	return true
 }
 
 func applyServerSpec(cfg *config) error {

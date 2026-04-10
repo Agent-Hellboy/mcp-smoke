@@ -429,8 +429,8 @@ func (b *anthropicBackend) Run(ctx context.Context, prompt string, catalog toolC
 
 func systemPrompt() string {
 	return strings.TrimSpace(`
-You are a tiny MCP smoke agent.
-Use the provided tools whenever they match the user's request.
+You are mcp-smoke-agent.
+Use the provided MCP tools whenever they match the user's request.
 Do not invent tools or arguments.
 If no tool fits, say that no MCP tool matches the request.
 After tool calls, answer briefly and directly with the result.

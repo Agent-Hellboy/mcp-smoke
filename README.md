@@ -4,7 +4,13 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/Agent-Hellboy/mcp-smoke.svg)](https://pkg.go.dev/github.com/Agent-Hellboy/mcp-smoke)
 [![Go Report Card](https://goreportcard.com/badge/github.com/Agent-Hellboy/mcp-smoke)](https://goreportcard.com/report/github.com/Agent-Hellboy/mcp-smoke)
 
-Single MCP CLI for smoke-testing servers and running a tiny plain-English MCP agent.
+Single MCP CLI for plain-English MCP smoke tests, plus an optional low-level protocol smoke mode.
+
+## Why use it in e2e harnesses
+
+`mcp-smoke-agent` is useful when you are building or testing MCP server infrastructure and want one realistic client in your end-to-end test harness.
+
+Instead of hand-writing raw MCP requests for every check, you can drive the server through the CLI with a plain-English request, let it invoke the real MCP tool path, and verify the surrounding infrastructure behavior. That is useful for checking things like routing, auth, logging, tracing, and whether analytics are generated correctly for real tool-invocation flows.
 
 ## Install
 
@@ -45,14 +51,17 @@ tar -xzf mcp-smoke-agent.tar.gz
 
 ## Usage
 
-The binary has two subcommands:
+Default mode:
 
-- `mcp-smoke-agent smoke`
-- `mcp-smoke-agent agent`
+- `mcp-smoke-agent [flags] [plain English request]`
 
-### Plain-English MCP agent
+Optional raw protocol report:
 
-The `agent` subcommand connects to an MCP server, lists its tools, and lets an OpenAI or Anthropic model decide which MCP tool to call from plain-English input.
+- `mcp-smoke-agent smoke [flags]`
+
+### Plain-English MCP smoke requests
+
+The default command connects to an MCP server, lists its tools, and lets an OpenAI or Anthropic model decide which MCP tool to call from plain-English input.
 
 OpenAI with a single server flag:
 
@@ -61,21 +70,21 @@ cat > .env <<'EOF'
 OPENAI_API_KEY=your-key-here
 EOF
 
-go run ./cmd/mcp-smoke-agent agent --server "go run ./cmd/mcp-test-server"
+go run ./cmd/mcp-smoke-agent --server "go run ./cmd/mcp-test-server"
 ```
 
 Anthropic with a single server flag:
 
 ```bash
 export ANTHROPIC_API_KEY=...
-go run ./cmd/mcp-smoke-agent agent --provider anthropic --server "go run ./cmd/mcp-test-server"
+go run ./cmd/mcp-smoke-agent --provider anthropic --server "go run ./cmd/mcp-test-server"
 ```
 
 One-shot prompt:
 
 ```bash
 export OPENAI_API_KEY=...
-go run ./cmd/mcp-smoke-agent agent \
+go run ./cmd/mcp-smoke-agent \
   --server "go run ./cmd/mcp-test-server" \
   --prompt "add 41 and 1"
 ```
@@ -84,7 +93,21 @@ HTTP server:
 
 ```bash
 export OPENAI_API_KEY=...
-go run ./cmd/mcp-smoke-agent agent --server http://localhost:3000/mcp
+go run ./cmd/mcp-smoke-agent --server http://localhost:3000/mcp
+```
+
+One-shot prompt as trailing text:
+
+```bash
+export OPENAI_API_KEY=...
+go run ./cmd/mcp-smoke-agent --server "go run ./cmd/mcp-test-server" "add 41 and 1"
+```
+
+Piped stdin:
+
+```bash
+export OPENAI_API_KEY=...
+printf 'add 41 and 1\n' | go run ./cmd/mcp-smoke-agent --server "go run ./cmd/mcp-test-server"
 ```
 
 `--server` accepts:
@@ -93,9 +116,9 @@ go run ./cmd/mcp-smoke-agent agent --server http://localhost:3000/mcp
 - A stdio command string like `go run ./cmd/mcp-test-server`
 - A JSON array command like `["go","run","./cmd/mcp-test-server"]`
 
-The agent connects once, lists the MCP tools, and for each plain-English prompt refreshes the tool list and keeps doing the model/tool roundtrips until the model finishes the response or hits `--max-steps`.
+The default mode connects once, lists the MCP tools, and for each plain-English prompt refreshes the tool list and keeps doing the model/tool roundtrips until the model finishes the response or hits `--max-steps`.
 
-By default the agent reads:
+By default the CLI reads:
 
 - `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`
 - `OPENAI_MODEL` or `ANTHROPIC_MODEL`
@@ -106,13 +129,15 @@ Default models are `gpt-4.1-mini` for OpenAI and `claude-3-5-haiku-latest` for A
 
 ### GitHub E2E
 
-If you set the repo secret `OPENAI_API_KEY`, CI will run a live e2e check for `mcp-smoke-agent agent` against the bundled `mcp-test-server`. The workflow writes a temporary `.env`, runs the agent, and asserts both the MCP tool call and the final `42` response.
+If you set the repo secret `OPENAI_API_KEY`, CI can run a live e2e check for `mcp-smoke-agent` against the bundled `mcp-test-server`. The workflow writes a temporary `.env`, runs a plain-English request, and asserts both the MCP tool call and the final `42` response.
 
 ### GitHub Release Automation
 
 Tags matching `v*` trigger a release workflow that builds archives for `mcp-smoke-agent`, uploads them to the GitHub release, and publishes `checksums.txt`. You can also run the release workflow manually for an existing tag.
 
 ### Smoke Usage
+
+If you want the raw protocol checklist without an LLM, use the `smoke` subcommand.
 
 Streamable HTTP:
 
@@ -126,7 +151,7 @@ Stdio:
 mcp-smoke-agent smoke --transport=stdio --command ./your-mcp-server -- <args>
 ```
 
-The smoke subcommand is now more flexible when tools or prompts require arguments:
+The `smoke` subcommand is more flexible when tools or prompts require arguments:
 
 - If you pass `--tool-args` or `--prompt-args`, it will scan the advertised entries and call the first one whose required top-level args are satisfied.
 - You can force a specific entry with `--tool-name` or `--prompt-name`.
@@ -134,7 +159,7 @@ The smoke subcommand is now more flexible when tools or prompts require argument
 
 ### Local smoke server
 
-The bundled `mcp-test-server` now exposes a few simple tools for quick agent checks:
+The bundled `mcp-test-server` exposes a few simple tools for quick smoke checks:
 
 - `echo`
 - `add`

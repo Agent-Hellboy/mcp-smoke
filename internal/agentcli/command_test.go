@@ -1,6 +1,7 @@
 package agentcli
 
 import (
+	"io"
 	"strings"
 	"testing"
 )
@@ -114,5 +115,72 @@ func TestResolveProviderUsesDotEnv(t *testing.T) {
 	}
 	if provider != "openai" {
 		t.Fatalf("expected openai provider, got %q", provider)
+	}
+}
+
+func TestParseConfigUsesPositionalPromptWithServer(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := parseConfig([]string{
+		"--env-file", "",
+		"--provider", "openai",
+		"--api-key", "test-key",
+		"--server", "go run ./cmd/mcp-test-server",
+		"add 41 and 1",
+	}, io.Discard)
+	if err != nil {
+		t.Fatalf("parseConfig returned error: %v", err)
+	}
+
+	if cfg.prompt != "add 41 and 1" {
+		t.Fatalf("expected positional prompt, got %q", cfg.prompt)
+	}
+	if len(cfg.args) != 2 || cfg.args[0] != "run" || cfg.args[1] != "./cmd/mcp-test-server" {
+		t.Fatalf("unexpected server args %#v", cfg.args)
+	}
+	if cfg.command != "go" {
+		t.Fatalf("expected command go, got %q", cfg.command)
+	}
+}
+
+func TestParseConfigKeepsTrailingStdioArgs(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := parseConfig([]string{
+		"--env-file", "",
+		"--provider", "openai",
+		"--api-key", "test-key",
+		"--transport", "stdio",
+		"--command", "go",
+		"--",
+		"run",
+		"./cmd/mcp-test-server",
+	}, io.Discard)
+	if err != nil {
+		t.Fatalf("parseConfig returned error: %v", err)
+	}
+
+	if cfg.prompt != "" {
+		t.Fatalf("expected empty prompt, got %q", cfg.prompt)
+	}
+	if len(cfg.args) != 2 || cfg.args[0] != "run" || cfg.args[1] != "./cmd/mcp-test-server" {
+		t.Fatalf("unexpected stdio args %#v", cfg.args)
+	}
+}
+
+func TestParseConfigRequiresServer(t *testing.T) {
+	t.Parallel()
+
+	_, err := parseConfig([]string{
+		"--env-file", "",
+		"--provider", "openai",
+		"--api-key", "test-key",
+		"--prompt", "ping",
+	}, io.Discard)
+	if err == nil {
+		t.Fatal("expected missing-server error")
+	}
+	if !strings.Contains(err.Error(), "missing MCP server") {
+		t.Fatalf("expected missing-server error, got %v", err)
 	}
 }
